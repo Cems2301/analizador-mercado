@@ -36,12 +36,26 @@ python analizador.py --comparar --intervalo 4h   # compara todas las estrategias
 ## Ejecución en la nube (GitHub Actions)
 
 El workflow `.github/workflows/ejecucion_nube.yml` corre de lunes a viernes cada 4 horas (UTC)
-y se puede lanzar a mano desde **Actions → Análisis de mercado en la nube → Run workflow**.
+los escenarios donde la estrategia `sma100-rsi7-2.5r` pasa el veto en el backtest:
+
+| Escenario | Plataforma | Intervalo | Activos |
+|---|---|---|---|
+| BTC-ETH 4h | BINANCE_OKX | 4h | BTC-USD, ETH-USD |
+| PAXG 1d | BINANCE_OKX | 1d | PAXG-USD |
+| SPY 1d (HAPI) | HAPI | 1d | SPY |
+
+Cada escenario corre en paralelo y manda su propio resumen por Telegram. Se editan en la
+`matrix` del job `programados`.
+
+A mano: **Actions → Análisis de mercado en la nube → Run workflow**. Con `programados` corre
+los mismos 3 escenarios; con `personalizado` usa la plataforma e intervalo elegidos y las
+variables del repositorio.
 
 1. **Settings → Secrets and variables → Actions → Secrets**: crea `TELEGRAM_BOT_TOKEN` y `TELEGRAM_CHAT_ID`.
-2. Opcional, en la pestaña **Variables**: `MODO_PLATAFORMA`, `CAPITAL_TOTAL`, `ACTIVOS`
-   (ej. `BTC-USD,SOL-USD`), `INTERVALO` (`1d`/`4h`), `FUENTES_CRIPTO` (ej. `binance,okx,yahoo`),
-   `ESTRATEGIA`, `TELEGRAM_SOLO_CON_SENAL` (`true` para avisar solo cuando hay una señal aprobada).
+2. Opcional, en la pestaña **Variables**: `CAPITAL_TOTAL`, `FUENTES_CRIPTO` (ej. `binance,okx,yahoo`),
+   `TELEGRAM_SOLO_CON_SENAL` (`true` para avisar solo cuando hay una señal aprobada).
+   Solo para `personalizado`: `MODO_PLATAFORMA`, `ACTIVOS` (ej. `BTC-USD,SOL-USD`),
+   `INTERVALO` (`1d`/`4h`), `ESTRATEGIA`.
 
 En repositorios públicos, GitHub pausa los workflows programados tras 60 días sin actividad.
 

@@ -7,13 +7,18 @@ on:
     - cron: "7 */4 * * 1-5"
   workflow_dispatch:
     inputs:
+      escenario:
+        description: "programados = los 3 escenarios del horario; personalizado = usa plataforma e intervalo"
+        type: choice
+        options: [programados, personalizado]
+        default: programados
       modo:
-        description: "Plataforma"
+        description: "Plataforma (solo personalizado)"
         type: choice
         options: [por-defecto, BINANCE_OKX, HAPI]
         default: por-defecto
       intervalo:
-        description: "Intervalo de velas"
+        description: "Intervalo de velas (solo personalizado)"
         type: choice
         options: [por-defecto, 1d, 4h]
         default: por-defecto
@@ -26,7 +31,62 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  analizar:
+  # Escenarios donde la estrategia pasa el veto estadístico (N >= 10 y E > 0)
+  # según el backtest comparativo del 15-oct-2026. Cada uno corre en paralelo
+  # y manda su propio resumen por Telegram.
+  programados:
+    if: github.event_name == 'schedule' || inputs.escenario == 'programados'
+    name: ${{ matrix.nombre }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - nombre: BTC-ETH 4h
+            modo: BINANCE_OKX
+            intervalo: 4h
+            activos: BTC-USD,ETH-USD
+            estrategia: sma100-rsi7-2.5r
+          - nombre: PAXG 1d
+            modo: BINANCE_OKX
+            intervalo: 1d
+            activos: PAXG-USD
+            estrategia: sma100-rsi7-2.5r
+          - nombre: SPY 1d (HAPI)
+            modo: HAPI
+            intervalo: 1d
+            activos: SPY
+            estrategia: sma100-rsi7-2.5r
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v4
+
+      - name: Instalar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Ejecutar analizador
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CAPITAL_TOTAL: ${{ vars.CAPITAL_TOTAL }}
+          FUENTES_CRIPTO: ${{ vars.FUENTES_CRIPTO }}
+          TELEGRAM_SOLO_CON_SENAL: ${{ vars.TELEGRAM_SOLO_CON_SENAL }}
+          MODO_PLATAFORMA: ${{ matrix.modo }}
+          INTERVALO: ${{ matrix.intervalo }}
+          ACTIVOS: ${{ matrix.activos }}
+          ESTRATEGIA: ${{ matrix.estrategia }}
+        run: python analizador.py
+
+  # Lanzamiento manual con plataforma/intervalo a elección (y variables del repo).
+  personalizado:
+    if: github.event_name == 'workflow_dispatch' && inputs.escenario == 'personalizado'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
