@@ -1,0 +1,57 @@
+name: Análisis de mercado en la nube
+
+on:
+  schedule:
+    # Lunes a viernes cada 4 horas (hora UTC). Minuto 7 en vez de 0 porque
+    # GitHub retrasa o descarta ejecuciones programadas en el minuto 0.
+    - cron: "7 */4 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      modo:
+        description: "Plataforma"
+        type: choice
+        options: [por-defecto, BINANCE_OKX, HAPI]
+        default: por-defecto
+      intervalo:
+        description: "Intervalo de velas"
+        type: choice
+        options: [por-defecto, 1d, 4h]
+        default: por-defecto
+
+permissions:
+  contents: read
+
+concurrency:
+  group: analisis-mercado
+  cancel-in-progress: false
+
+jobs:
+  analizar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v4
+
+      - name: Instalar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Ejecutar analizador
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Opcionales: Settings > Secrets and variables > Actions > Variables.
+          # Si no existen, config.py usa sus valores por defecto.
+          CAPITAL_TOTAL: ${{ vars.CAPITAL_TOTAL }}
+          ACTIVOS: ${{ vars.ACTIVOS }}
+          FUENTES_CRIPTO: ${{ vars.FUENTES_CRIPTO }}
+          TELEGRAM_SOLO_CON_SENAL: ${{ vars.TELEGRAM_SOLO_CON_SENAL }}
+          MODO_PLATAFORMA: ${{ (inputs.modo != 'por-defecto' && inputs.modo) || vars.MODO_PLATAFORMA }}
+          INTERVALO: ${{ (inputs.intervalo != 'por-defecto' && inputs.intervalo) || vars.INTERVALO }}
+        run: python analizador.py
