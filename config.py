@@ -10,6 +10,7 @@ Ejemplo local (bash):         MODO_PLATAFORMA=HAPI python analizador.py
 """
 
 import os
+from dataclasses import dataclass
 
 
 def _env_str(nombre: str, defecto: str) -> str:
@@ -46,7 +47,7 @@ def _env_lista(nombre: str) -> list[str]:
 CAPITAL_TOTAL = _env_float("CAPITAL_TOTAL", 150.0)                # USD
 RIESGO_POR_OPERACION = _env_float("RIESGO_POR_OPERACION", 0.02)   # 2% = 1R
 TOPE_MAX_ASIGNACION = _env_float("TOPE_MAX_ASIGNACION", 0.50)     # máx. 50% del capital por posición
-RATIO_BENEFICIO_RIESGO = _env_float("RATIO_BENEFICIO_RIESGO", 2.5)  # TP a 2.5R
+# El ratio beneficio/riesgo (objetivo en R) ahora es parte de cada estrategia: ver más abajo.
 
 # --------------------------------------------------------------------------
 # Plataforma y activos
@@ -100,11 +101,57 @@ if INTERVALO not in ("1d", "4h"):
     INTERVALO = "1d"
 
 ANIOS_HISTORICO = 3
-PERIODO_SMA = 50
-PERIODO_RSI = 14
 PERIODO_ATR = 14
-RSI_UMBRAL_ENTRADA = 45.0
-MULTIPLICADOR_ATR_STOP = 1.5
+
+
+# --------------------------------------------------------------------------
+# Estrategias: compra en retroceso dentro de tendencia
+# --------------------------------------------------------------------------
+@dataclass(frozen=True)
+class Estrategia:
+    nombre: str
+    periodo_sma: int        # filtro de tendencia: Precio > SMA
+    periodo_rsi: int        # retroceso: RSI < umbral
+    rsi_umbral: float
+    rsi_giro: bool          # exigir además que el RSI suba respecto a la vela anterior
+    mult_atr_stop: float    # stop = entrada - mult * ATR14
+    ratio: float            # objetivo = entrada + ratio * (entrada - stop)
+
+    def describir(self) -> str:
+        giro = " y girando al alza" if self.rsi_giro else ""
+        return (f"Precio > SMA{self.periodo_sma}, RSI{self.periodo_rsi} < {self.rsi_umbral:g}{giro}; "
+                f"stop {self.mult_atr_stop:g} x ATR{PERIODO_ATR}, objetivo {self.ratio:g}R")
+
+
+ESTRATEGIA_ORIGINAL = Estrategia("original", 50, 14, 45.0, False, 1.5, 2.5)
+
+
+def _variantes():
+    """Tendencia más amplia + retroceso táctico + stop más holgado (2.0 ATR)."""
+    for sma in (100, 200):
+        for periodo_rsi, umbral, giro in ((7, 35.0, False), (14, 50.0, True)):
+            for ratio in (2.0, 2.5):
+                retroceso = f"rsi{periodo_rsi}{'giro' if giro else ''}"
+                yield Estrategia(f"sma{sma}-{retroceso}-{ratio:g}r", sma, periodo_rsi, umbral, giro, 2.0, ratio)
+
+
+# Todas se comparan con: python analizador.py --comparar
+ESTRATEGIAS = {e.nombre: e for e in (ESTRATEGIA_ORIGINAL, *_variantes())}
+
+# Ganadora del backtest comparativo del 15-oct-2026 (9 combinaciones activo-intervalo):
+# mayor P&L neto total, más operaciones que la original y E > 0 en ambas mitades del periodo.
+ESTRATEGIA_POR_DEFECTO = "sma100-rsi7-2.5r"
+
+_nombre_estrategia = _env_str("ESTRATEGIA", ESTRATEGIA_POR_DEFECTO).lower()
+if _nombre_estrategia not in ESTRATEGIAS:
+    print(f"[config] ESTRATEGIA={_nombre_estrategia!r} no existe; uso {ESTRATEGIA_POR_DEFECTO!r}. "
+          f"Opciones: {', '.join(ESTRATEGIAS)}")
+    _nombre_estrategia = ESTRATEGIA_POR_DEFECTO
+ESTRATEGIA_PRINCIPAL = ESTRATEGIAS[_nombre_estrategia]
+
+# Veto estadístico: una señal técnica solo se aprueba si el backtest del activo
+# tiene al menos este número de operaciones cerradas y esperanza neta E > 0.
+MIN_OPERACIONES_VALIDAS = int(_env_float("MIN_OPERACIONES_VALIDAS", 10))
 
 # --------------------------------------------------------------------------
 # Telegram (opcional)

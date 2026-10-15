@@ -51,6 +51,7 @@ jobs:
           CAPITAL_TOTAL: ${{ vars.CAPITAL_TOTAL }}
           ACTIVOS: ${{ vars.ACTIVOS }}
           FUENTES_CRIPTO: ${{ vars.FUENTES_CRIPTO }}
+          ESTRATEGIA: ${{ vars.ESTRATEGIA }}
           TELEGRAM_SOLO_CON_SENAL: ${{ vars.TELEGRAM_SOLO_CON_SENAL }}
           MODO_PLATAFORMA: ${{ (inputs.modo != 'por-defecto' && inputs.modo) || vars.MODO_PLATAFORMA }}
           INTERVALO: ${{ (inputs.intervalo != 'por-defecto' && inputs.intervalo) || vars.INTERVALO }}

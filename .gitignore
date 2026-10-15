@@ -3,3 +3,5 @@ venv/
 __pycache__/
 *.pyc
 .env
+analizador_mercado.zip
+analizador_mercado.bundle

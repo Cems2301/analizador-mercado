@@ -1,15 +1,19 @@
 """
 Analizador cuantitativo para cuenta pequeña.
 
-Estrategia: compra en retroceso dentro de tendencia alcista.
-    Entrada : Precio > SMA50  y  RSI14 < 45
-    Stop    : entrada - 1.5 * ATR14
+Estrategia: compra en retroceso dentro de tendencia alcista (parametrizada en config.py).
+    Por defecto (sma100-rsi7-2.5r):
+    Entrada : Precio > SMA100  y  RSI7 < 35
+    Stop    : entrada - 2.0 * ATR14
     Objetivo: entrada + 2.5 * (entrada - stop)
+    Veto    : la señal solo se aprueba si el backtest del activo tiene N >= 10 y E > 0
 
 Uso:
     python analizador.py                          # usa config.py / variables de entorno
     python analizador.py --modo HAPI              # SPY, QQQ, DBA con comisión fija
     python analizador.py SOL-USD BTC-USD --intervalo 4h --capital 200
+    python analizador.py --comparar               # backtest de todas las estrategias candidatas
+    python analizador.py --estrategia original    # usar otra estrategia de config.ESTRATEGIAS
 """
 
 import argparse
@@ -28,6 +32,7 @@ import yfinance as yf
 import config
 
 COLUMNAS_OHLC = ["Open", "High", "Low", "Close"]
+MIN_VELAS = 60  # mínimo para que la descarga se considere válida
 
 
 # ==========================================================================
@@ -53,7 +58,7 @@ def _inicio_historico() -> datetime:
 def _limpiar_velas(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     df = df[COLUMNAS_OHLC + ["Volume"]].dropna(subset=COLUMNAS_OHLC)
     df = df[~df.index.duplicated(keep="last")].sort_index()
-    if len(df) < config.PERIODO_SMA + 10:
+    if len(df) < MIN_VELAS:
         raise ErrorFuente(f"historial insuficiente para {ticker}: {len(df)} velas")
     return df
 
@@ -304,12 +309,15 @@ def calcular_atr(df: pd.DataFrame, periodo: int) -> pd.Series:
     return rango_verdadero.ewm(alpha=1.0 / periodo, adjust=False, min_periods=periodo).mean()
 
 
-def agregar_indicadores(df: pd.DataFrame) -> pd.DataFrame:
+def agregar_indicadores(df: pd.DataFrame, est: config.Estrategia) -> pd.DataFrame:
     df = df.copy()
-    df["SMA"] = calcular_sma(df["Close"], config.PERIODO_SMA)
-    df["RSI"] = calcular_rsi(df["Close"], config.PERIODO_RSI)
+    df["SMA"] = calcular_sma(df["Close"], est.periodo_sma)
+    df["RSI"] = calcular_rsi(df["Close"], est.periodo_rsi)
     df["ATR"] = calcular_atr(df, config.PERIODO_ATR)
-    df["senal"] = (df["Close"] > df["SMA"]) & (df["RSI"] < config.RSI_UMBRAL_ENTRADA)
+    senal = (df["Close"] > df["SMA"]) & (df["RSI"] < est.rsi_umbral)
+    if est.rsi_giro:
+        senal &= df["RSI"] > df["RSI"].shift(1)
+    df["senal"] = senal
     return df
 
 
@@ -353,18 +361,19 @@ class PlanOperacion:
     notas: list[str] = field(default_factory=list)
 
 
-def calcular_plan(entrada: float, atr: float, capital: float, modo: str) -> PlanOperacion:
+def calcular_plan(entrada: float, atr: float, capital: float, modo: str,
+                  est: config.Estrategia) -> PlanOperacion:
     """Stop, objetivo y tamaño de posición en USD descontando comisiones.
 
     Se dimensiona para que la pérdida total en el stop (movimiento de precio
     + comisión) sea exactamente 1R, salvo que el tope de asignación lo impida.
     """
-    riesgo_unitario = config.MULTIPLICADOR_ATR_STOP * atr
+    riesgo_unitario = est.mult_atr_stop * atr
     stop = entrada - riesgo_unitario
     plan = PlanOperacion(
         entrada=entrada,
         stop=stop,
-        take_profit=entrada + config.RATIO_BENEFICIO_RIESGO * riesgo_unitario,
+        take_profit=entrada + est.ratio * riesgo_unitario,
         distancia_stop_pct=riesgo_unitario / entrada if entrada > 0 else float("nan"),
         riesgo_objetivo=capital * config.RIESGO_POR_OPERACION,
     )
@@ -396,7 +405,7 @@ def calcular_plan(entrada: float, atr: float, capital: float, modo: str) -> Plan
     plan.unidades = monto / entrada
     plan.comision = comision_total(monto, modo)
     plan.perdida_neta_sl = monto * d + plan.comision
-    plan.ganancia_neta_tp = monto * config.RATIO_BENEFICIO_RIESGO * d - plan.comision
+    plan.ganancia_neta_tp = monto * est.ratio * d - plan.comision
     if plan.limitado_por_tope:
         plan.notas.append(
             f"Posición limitada al tope del {config.TOPE_MAX_ASIGNACION:.0%} (${tope:.2f}); "
@@ -408,7 +417,7 @@ def calcular_plan(entrada: float, atr: float, capital: float, modo: str) -> Plan
 # ==========================================================================
 # Backtest iterativo
 # ==========================================================================
-def backtest(df: pd.DataFrame, capital: float, modo: str) -> dict:
+def backtest(df: pd.DataFrame, capital: float, modo: str, est: config.Estrategia) -> dict:
     """Simula la estrategia vela a vela sobre todo el historial.
 
     - La señal se evalúa al cierre de la vela i y se entra en la apertura de i+1.
@@ -434,7 +443,7 @@ def backtest(df: pd.DataFrame, capital: float, modo: str) -> dict:
 
         j = i + 1
         entrada = apertura[j]
-        plan = calcular_plan(entrada, atr[i], capital, modo)
+        plan = calcular_plan(entrada, atr[i], capital, modo, est)
         if not plan.valido:
             i += 1
             continue
@@ -511,36 +520,126 @@ def resumir_backtest(operaciones: list[dict], posicion_abierta: dict | None, cap
 # ==========================================================================
 # Análisis por activo
 # ==========================================================================
-def analizar_activo(ticker: str, modo: str, capital: float, intervalo: str) -> dict:
-    df, precio, marca, fuente, fallos_fuente = obtener_datos(ticker, intervalo)
+def cargar_activo(ticker: str, intervalo: str) -> dict:
+    """Velas + precio en vivo, descargados una vez y reutilizados por cada estrategia."""
+    df, precio, marca, fuente, avisos = obtener_datos(ticker, intervalo)
     if precio is not None:
         df = incorporar_precio_vivo(df, precio, marca, intervalo)
         fuente_precio = f"en vivo ({marca.tz_convert('UTC'):%Y-%m-%d %H:%M} UTC)"
     else:
         precio = float(df["Close"].iloc[-1])
         fuente_precio = "último cierre (sin precio en vivo)"
+    return {"ticker": ticker, "df": df, "precio": precio, "fuente_precio": fuente_precio,
+            "fuente": fuente, "avisos": avisos}
 
-    df = agregar_indicadores(df)
+
+def vetos_senal(bt: dict, plan: PlanOperacion | None) -> list[str]:
+    """Motivos por los que una señal técnica NO es operable (lista vacía = aprobada)."""
+    motivos = []
+    if bt["esperanza_usd"] <= 0:
+        motivos.append("E<=0")
+    if bt["total"] < config.MIN_OPERACIONES_VALIDAS:
+        motivos.append(f"N<{config.MIN_OPERACIONES_VALIDAS}")
+    if plan is not None and not plan.valido:
+        motivos.append("plan inválido")
+    return motivos
+
+
+def evaluar_activo(datos: dict, est: config.Estrategia, modo: str, capital: float) -> dict:
+    df = agregar_indicadores(datos["df"], est)
     ultima = df.iloc[-1]
-    senal_activa = bool(ultima["senal"])
-    plan = calcular_plan(precio, float(ultima["ATR"]), capital, modo) if senal_activa else None
-
+    senal = bool(ultima["senal"])
+    bt = backtest(df, capital, modo, est)
+    plan = calcular_plan(datos["precio"], float(ultima["ATR"]), capital, modo, est) if senal else None
     return {
-        "ticker": ticker,
-        "fuente": fuente,
-        "fallos_fuente": fallos_fuente,
-        "precio": precio,
-        "fuente_precio": fuente_precio,
+        "ticker": datos["ticker"],
+        "fuente": datos["fuente"],
+        "avisos": datos["avisos"],
+        "precio": datos["precio"],
+        "fuente_precio": datos["fuente_precio"],
+        "estrategia": est,
         "sma": float(ultima["SMA"]),
         "rsi": float(ultima["RSI"]),
+        "rsi_previo": float(df["RSI"].iloc[-2]),
         "atr": float(ultima["ATR"]),
-        "senal": senal_activa,
+        "senal": senal,
+        "vetos": vetos_senal(bt, plan) if senal else [],
         "plan": plan,
-        "backtest": backtest(df, capital, modo),
+        "backtest": bt,
         "desde": df.index[0],
         "hasta": df.index[-1],
         "velas": len(df),
     }
+
+
+def aprobada(r: dict) -> bool:
+    return r["senal"] and not r["vetos"]
+
+
+# ==========================================================================
+# Comparación de estrategias
+# ==========================================================================
+def comparar_estrategias(cargados: list[dict], modo: str, capital: float) -> list[dict]:
+    """Backtest de cada estrategia candidata sobre los mismos datos.
+
+    Además del total, separa las operaciones según caigan en la primera o la
+    segunda mitad del periodo, para ver si la esperanza se sostiene en el tiempo.
+    """
+    filas = []
+    for est in config.ESTRATEGIAS.values():
+        todas, primera, segunda, por_activo = [], [], [], {}
+        for datos in cargados:
+            df = agregar_indicadores(datos["df"], est)
+            bt = backtest(df, capital, modo, est)
+            mitad = df.index[0] + (df.index[-1] - df.index[0]) / 2
+            for op in bt["operaciones"]:
+                (primera if op["fecha_entrada"] < mitad else segunda).append(op)
+            todas += bt["operaciones"]
+            por_activo[datos["ticker"]] = bt
+        filas.append({
+            "estrategia": est,
+            "global": resumir_backtest(todas, None, capital),
+            "primera": resumir_backtest(primera, None, capital),
+            "segunda": resumir_backtest(segunda, None, capital),
+            "por_activo": por_activo,
+            "validos": sum(bt["total"] >= config.MIN_OPERACIONES_VALIDAS and bt["esperanza_usd"] > 0
+                           for bt in por_activo.values()),
+        })
+    return filas
+
+
+def _e_con_n(bt: dict) -> str:
+    return f"{fmt_usd(bt['esperanza_usd'], signo=True)} ({bt['total']})"
+
+
+def tabla_comparacion(filas: list[dict], principal: config.Estrategia) -> str:
+    tickers = list(filas[0]["por_activo"])
+    columnas = (f"{'Estrategia':<21} {'Ops':>4} {'Acierto':>7} {'E/op':>7} {'E(R)':>6} {'P&L':>8} "
+                f"{'E 1ª mitad':>13} {'E 2ª mitad':>13} {'Aprobables':>10}")
+    lineas = [
+        "Ops/E/P&L: todas las operaciones de todos los activos juntas. 'Aprobables': activos",
+        f"que pasarían el veto (N >= {config.MIN_OPERACIONES_VALIDAS} y E > 0). (*) = estrategia principal.",
+        "",
+        columnas,
+        "-" * len(columnas),
+    ]
+    for f in filas:
+        g = f["global"]
+        nombre = f["estrategia"].nombre + (" *" if f["estrategia"] == principal else "")
+        lineas.append(
+            f"{nombre:<21} {g['total']:>4} {g['win_rate']:>7.1%} "
+            f"{fmt_usd(g['esperanza_usd'], signo=True):>7} {g['esperanza_r']:>+6.2f} "
+            f"{fmt_usd(g['pnl_total'], signo=True):>8} {_e_con_n(f['primera']):>13} "
+            f"{_e_con_n(f['segunda']):>13} {f['validos']:>8}/{len(tickers)}"
+        )
+
+    lineas += ["", "Por activo: E por operación (número de operaciones)",
+               f"{'Estrategia':<21}" + "".join(f" {t:>15}" for t in tickers),
+               "-" * (21 + 16 * len(tickers))]
+    for f in filas:
+        lineas.append(f"{f['estrategia'].nombre:<21}"
+                      + "".join(f" {_e_con_n(f['por_activo'][t]):>15}" for t in tickers))
+    return "\n".join(lineas)
 
 
 # ==========================================================================
@@ -563,45 +662,65 @@ def fmt_usd(valor: float, signo: bool = False) -> str:
     return f"{'-' if valor < 0 else ''}${texto}"
 
 
+def etiqueta_senal(r: dict) -> str:
+    if not r["senal"]:
+        return "no"
+    if not r["vetos"]:
+        return "Señal APROBADA (E>0)"
+    return f"Señal Técnica (Vetada por {', '.join(r['vetos'])})"
+
+
 def motivo_sin_senal(r: dict) -> str:
+    est = r["estrategia"]
     motivos = []
     if not r["precio"] > r["sma"]:
-        motivos.append(f"precio <= SMA{config.PERIODO_SMA}")
-    if not r["rsi"] < config.RSI_UMBRAL_ENTRADA:
-        motivos.append(f"RSI {r['rsi']:.1f} >= {config.RSI_UMBRAL_ENTRADA:.0f}")
+        motivos.append(f"precio <= SMA{est.periodo_sma}")
+    if not r["rsi"] < est.rsi_umbral:
+        motivos.append(f"RSI{est.periodo_rsi} {r['rsi']:.1f} >= {est.rsi_umbral:g}")
+    if est.rsi_giro and not r["rsi"] > r["rsi_previo"]:
+        motivos.append("RSI sin giro al alza")
     return ", ".join(motivos) or "condiciones no cumplidas"
 
 
 def reporte_consola(r: dict, modo: str) -> str:
     bt = r["backtest"]
+    est = r["estrategia"]
+    si_no = lambda condicion: "SI" if condicion else "NO"  # noqa: E731
+    condiciones = (f"  Precio > SMA{est.periodo_sma}: {si_no(r['precio'] > r['sma'])}   "
+                   f"RSI{est.periodo_rsi} < {est.rsi_umbral:g}: {si_no(r['rsi'] < est.rsi_umbral)}")
+    if est.rsi_giro:
+        condiciones += (f"   Giro al alza: {si_no(r['rsi'] > r['rsi_previo'])} "
+                        f"({r['rsi_previo']:.1f} -> {r['rsi']:.1f})")
     lineas = [
         "-" * 72,
         f"{r['ticker']}  |  {r['fuente']}  |  precio {fmt_precio(r['precio'])}  [{r['fuente_precio']}]",
         "-" * 72,
-        *[f"  Aviso de datos: {aviso}" for aviso in r["fallos_fuente"]],
-        f"  SMA{config.PERIODO_SMA}: {fmt_precio(r['sma'])}   RSI{config.PERIODO_RSI}: {r['rsi']:.2f}   "
+        *[f"  Aviso de datos: {aviso}" for aviso in r["avisos"]],
+        f"  SMA{est.periodo_sma}: {fmt_precio(r['sma'])}   RSI{est.periodo_rsi}: {r['rsi']:.2f}   "
         f"ATR{config.PERIODO_ATR}: {fmt_precio(r['atr'])} ({r['atr'] / r['precio']:.2%})",
-        f"  Precio > SMA{config.PERIODO_SMA}: {'SI' if r['precio'] > r['sma'] else 'NO'}   "
-        f"RSI < {config.RSI_UMBRAL_ENTRADA:.0f}: {'SI' if r['rsi'] < config.RSI_UMBRAL_ENTRADA else 'NO'}",
+        condiciones,
     ]
 
-    if r["senal"]:
+    if aprobada(r):
         p = r["plan"]
-        lineas.append("  >>> SEÑAL DE ENTRADA ACTIVA HOY <<<")
-        if p.valido:
-            lineas += [
-                f"  Entrada      : {fmt_precio(p.entrada)}",
-                f"  Stop Loss    : {fmt_precio(p.stop)}  (-{p.distancia_stop_pct:.2%}, "
-                f"{config.MULTIPLICADOR_ATR_STOP} x ATR)",
-                f"  Take Profit  : {fmt_precio(p.take_profit)}  "
-                f"(+{p.distancia_stop_pct * config.RATIO_BENEFICIO_RIESGO:.2%}, "
-                f"{config.RATIO_BENEFICIO_RIESGO}R)",
-                f"  Tamaño       : {fmt_usd(p.monto_usd)}  ({p.unidades:.8f} unidades)",
-                f"  Comisión i/v : {fmt_usd(p.comision)} ({modo})",
-                f"  Pérdida neta si toca SL : {fmt_usd(p.perdida_neta_sl)}  (1R = {fmt_usd(p.riesgo_objetivo)})",
-                f"  Ganancia neta si toca TP: {fmt_usd(p.ganancia_neta_tp)}",
-            ]
-        lineas += [f"  Nota: {nota}" for nota in p.notas]
+        lineas += [
+            f"  >>> {etiqueta_senal(r)} <<<",
+            f"  Entrada      : {fmt_precio(p.entrada)}",
+            f"  Stop Loss    : {fmt_precio(p.stop)}  (-{p.distancia_stop_pct:.2%}, "
+            f"{est.mult_atr_stop:g} x ATR)",
+            f"  Take Profit  : {fmt_precio(p.take_profit)}  "
+            f"(+{p.distancia_stop_pct * est.ratio:.2%}, {est.ratio:g}R)",
+            f"  Tamaño       : {fmt_usd(p.monto_usd)}  ({p.unidades:.8f} unidades)",
+            f"  Comisión i/v : {fmt_usd(p.comision)} ({modo})",
+            f"  Pérdida neta si toca SL : {fmt_usd(p.perdida_neta_sl)}  (1R = {fmt_usd(p.riesgo_objetivo)})",
+            f"  Ganancia neta si toca TP: {fmt_usd(p.ganancia_neta_tp)}",
+            *[f"  Nota: {nota}" for nota in p.notas],
+        ]
+    elif r["senal"]:
+        lineas += [
+            f"  >>> {etiqueta_senal(r)} <<<",
+            "  La condición técnica se cumple, pero el backtest de este activo no la respalda: NO operar.",
+        ]
     else:
         lineas.append(f"  Sin señal hoy: {motivo_sin_senal(r)}")
 
@@ -640,25 +759,27 @@ def reporte_consola(r: dict, modo: str) -> str:
 
 
 def tabla_resumen(resultados: list[dict]) -> str:
-    columnas = (f"{'Activo':<9} {'Fuente':<14} {'Precio':>11} {'SMA50':>11} {'RSI':>5} "
-                f"{'Señal':<5} {'Ops':>4} {'Acierto':>7} {'E/op':>7} {'E(R)':>6}")
-    lineas = [columnas, "-" * len(columnas)]
+    est = resultados[0]["estrategia"]
+    columnas = (f"{'Activo':<9} {'Fuente':<14} {'Precio':>11} {'SMA' + str(est.periodo_sma):>11} "
+                f"{'RSI':>5} {'Ops':>4} {'Acierto':>7} {'E/op':>7} {'E(R)':>6}  Señal")
+    lineas = [columnas, "-" * (len(columnas) + 30)]
     for r in resultados:
         bt = r["backtest"]
         lineas.append(
             f"{r['ticker']:<9} {r['fuente']:<14} {fmt_precio(r['precio']):>11} {fmt_precio(r['sma']):>11} "
-            f"{r['rsi']:>5.1f} {'SI' if r['senal'] else 'no':<5} {bt['total']:>4} "
-            f"{bt['win_rate']:>7.1%} {fmt_usd(bt['esperanza_usd'], signo=True):>7} {bt['esperanza_r']:>+6.2f}"
+            f"{r['rsi']:>5.1f} {bt['total']:>4} {bt['win_rate']:>7.1%} "
+            f"{fmt_usd(bt['esperanza_usd'], signo=True):>7} {bt['esperanza_r']:>+6.2f}  {etiqueta_senal(r)}"
         )
     return "\n".join(lineas)
 
 
 def resumen_telegram(resultados: list[dict], errores: dict, modo: str, capital: float,
-                     intervalo: str, aviso_friccion: str | None) -> str:
+                     intervalo: str, est: config.Estrategia, aviso_friccion: str | None) -> str:
     ahora = datetime.now(timezone.utc)
     un_r = capital * config.RIESGO_POR_OPERACION
     lineas = [
         f"📊 {modo} | {intervalo} | {ahora:%Y-%m-%d %H:%M} UTC",
+        f"Estrategia {est.nombre}",
         f"Capital {fmt_usd(capital)} | 1R {fmt_usd(un_r)} | Tope {fmt_usd(capital * config.TOPE_MAX_ASIGNACION)}",
     ]
     if aviso_friccion:
@@ -667,18 +788,18 @@ def resumen_telegram(resultados: list[dict], errores: dict, modo: str, capital: 
     for r in resultados:
         bt = r["backtest"]
         lineas += ["", f"[{r['fuente']}]"]
-        if r["senal"] and r["plan"].valido:
+        if aprobada(r):
             p = r["plan"]
             lineas += [
-                f"🟢 {r['ticker']} {fmt_precio(r['precio'])}  SEÑAL DE COMPRA",
+                f"🟢 {r['ticker']} {fmt_precio(r['precio'])}  {etiqueta_senal(r)}",
                 f"  SL {fmt_precio(p.stop)} | TP {fmt_precio(p.take_profit)}",
                 f"  Monto {fmt_usd(p.monto_usd)} | -{fmt_usd(p.perdida_neta_sl)} / +{fmt_usd(p.ganancia_neta_tp)}",
             ]
             if p.limitado_por_tope:
                 lineas.append("  (limitado por tope de asignación)")
         elif r["senal"]:
-            lineas.append(f"🟡 {r['ticker']} {fmt_precio(r['precio'])}  señal sin plan válido: "
-                          f"{'; '.join(r['plan'].notas)}")
+            lineas += [f"🟡 {r['ticker']} {fmt_precio(r['precio'])}",
+                       f"  {etiqueta_senal(r)}: NO operar"]
         else:
             lineas.append(f"⚪ {r['ticker']} {fmt_precio(r['precio'])}  sin señal (RSI {r['rsi']:.1f})")
         if bt["total"]:
@@ -740,10 +861,15 @@ def main() -> int:
     parser.add_argument("--modo", choices=config.PLATAFORMAS_VALIDAS, default=config.MODO_PLATAFORMA)
     parser.add_argument("--intervalo", choices=["1d", "4h"], default=config.INTERVALO)
     parser.add_argument("--capital", type=float, default=config.CAPITAL_TOTAL)
+    parser.add_argument("--estrategia", choices=list(config.ESTRATEGIAS),
+                        default=config.ESTRATEGIA_PRINCIPAL.nombre)
+    parser.add_argument("--comparar", action="store_true",
+                        help="Backtest de todas las estrategias candidatas sobre los mismos datos")
     parser.add_argument("--sin-telegram", action="store_true", help="No enviar el resumen por Telegram")
     args = parser.parse_args()
 
     modo, capital, intervalo = args.modo, args.capital, args.intervalo
+    est = config.ESTRATEGIAS[args.estrategia]
     activos = [a.upper() for a in args.activos] or config.activos_para(modo)
     un_r = capital * config.RIESGO_POR_OPERACION
 
@@ -751,13 +877,16 @@ def main() -> int:
     print(f"ANÁLISIS CUANTITATIVO  |  {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC")
     print(f"Plataforma: {modo}   Intervalo: {intervalo}   Activos: {', '.join(activos)}")
     print(f"Capital: {fmt_usd(capital)}   1R ({config.RIESGO_POR_OPERACION:.0%}): {fmt_usd(un_r)}   "
-          f"Tope por posición: {fmt_usd(capital * config.TOPE_MAX_ASIGNACION)}   "
-          f"Objetivo: {config.RATIO_BENEFICIO_RIESGO}R")
+          f"Tope por posición: {fmt_usd(capital * config.TOPE_MAX_ASIGNACION)}")
     if modo == "HAPI":
         print(f"Comisión: {fmt_usd(config.COMISION_FIJA_HAPI)} fija ida y vuelta "
               f"({config.COMISION_FIJA_HAPI / un_r:.0%} de 1R)")
     else:
         print(f"Comisión: {config.COMISION_PCT_BINANCE_OKX:.2%} ida y vuelta sobre el monto")
+    if not args.comparar:
+        print(f"Estrategia: {est.nombre} -> {est.describir()}")
+        print(f"Veto: una señal solo se aprueba si su backtest tiene N >= "
+              f"{config.MIN_OPERACIONES_VALIDAS} operaciones y E > 0")
     if intervalo == "4h":
         print("Nota: en 4h, Yahoo solo entrega ~730 días de historial (acciones/ETFs); "
               "OKX y Binance sí dan 3 años.")
@@ -766,16 +895,22 @@ def main() -> int:
         print(aviso_friccion)
     print("=" * 72)
 
-    resultados, errores = [], {}
+    cargados, errores = [], {}
     for ticker in activos:
         try:
-            resultado = analizar_activo(ticker, modo, capital, intervalo)
+            cargados.append(cargar_activo(ticker, intervalo))
         except Exception as e:
             errores[ticker] = str(e)
-            print("-" * 72)
             print(f"{ticker}: ERROR -> {e}")
-            continue
-        resultados.append(resultado)
+
+    if args.comparar:
+        if cargados:
+            print(f"COMPARACIÓN DE ESTRATEGIAS ({', '.join(d['ticker'] for d in cargados)})")
+            print(tabla_comparacion(comparar_estrategias(cargados, modo, capital), est))
+        return 1 if not cargados else 0
+
+    resultados = [evaluar_activo(datos, est, modo, capital) for datos in cargados]
+    for resultado in resultados:
         print(reporte_consola(resultado, modo))
 
     print("=" * 72)
@@ -783,14 +918,16 @@ def main() -> int:
         print("RESUMEN")
         print(tabla_resumen(resultados))
         print("=" * 72)
-    senales = [r["ticker"] for r in resultados if r["senal"]]
-    print(f"Señales activas: {', '.join(senales) if senales else 'ninguna'}")
+    aprobadas = [r["ticker"] for r in resultados if aprobada(r)]
+    vetadas = [r["ticker"] for r in resultados if r["senal"] and r["vetos"]]
+    print(f"Señales APROBADAS: {', '.join(aprobadas) if aprobadas else 'ninguna'}")
+    print(f"Señales técnicas vetadas: {', '.join(vetadas) if vetadas else 'ninguna'}")
 
     if not args.sin_telegram and config.TELEGRAM_BOT_TOKEN and config.TELEGRAM_CHAT_ID:
-        if config.TELEGRAM_SOLO_CON_SENAL and not senales and not errores:
-            print("[telegram] Sin señales: no se envía mensaje (TELEGRAM_SOLO_CON_SENAL activo).")
+        if config.TELEGRAM_SOLO_CON_SENAL and not aprobadas and not errores:
+            print("[telegram] Sin señales aprobadas: no se envía mensaje (TELEGRAM_SOLO_CON_SENAL activo).")
         else:
-            texto = resumen_telegram(resultados, errores, modo, capital, intervalo, aviso_friccion)
+            texto = resumen_telegram(resultados, errores, modo, capital, intervalo, est, aviso_friccion)
             if enviar_telegram(texto):
                 print("[telegram] Resumen enviado.")
     elif not args.sin_telegram:
